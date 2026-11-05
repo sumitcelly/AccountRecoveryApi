@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+publish/
+TestResults/
+
+# Visual Studio and IDE files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
