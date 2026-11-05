@@ -1,0 +1,26 @@
+curl -X POST http://localhost:5000/api/telephony/incoming -H "Content-Type: application/json" \ 
+-d '[{"eventType":"Microsoft.Communication.IncomingCall",\
+"data":{"incomingCallContext":"mock-context-123"}}]'
+
+curl -X POST http://localhost:5000/api/telephony/callback \
+  -H "Content-Type: application/json" \
+  -d '[{
+    "id": "1111",
+    "source": "communications/connections/mock-context-123",
+    "type": "Microsoft.Communication.RecognizeCompleted",
+    "specversion": "1.0",
+    "data": {
+      "callConnectionId": "mock-context-123",
+      "recognitionType": "dtmf",
+      "dtmfResult": {
+        "tones": ["one", "two", "three", "four", "five"]
+      }
+    }
+  }]'
+
+# does not work
+#curl -X POST http://localhost:5000/api/telephony/callback -H 
+"Content-Type: application/json" -d 
+'[{"id":"1111","source":"communications/connections/mock-context-123",
+"type":"Microsoft.Communication.RecognizeCompleted","specversion":"1.0",
+"data":{"callConnectionId":"mock-context-123","recognizeResult":{"dtmfResult":{"tones":["Tone1","Tone2","Tone3","Tone4","Tone5"]}}}}]'

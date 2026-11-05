@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Enterprise Credential Synchronization</title>
+    <style>
+        body { 
+            font-family: 'Courier New', Courier, monospace; 
+            padding: 40px; 
+            background-color: #0f141c; 
+            color: #00ffaa; 
+        }
+        .box { 
+            border: 1px dashed #00ffaa; 
+            padding: 25px; 
+            width: 100%;
+            max-width: 480px; 
+            background-color: #161f2b; 
+            box-sizing: border-box;
+        }
+        input { 
+            background: #0f141c; 
+            color: #fff; 
+            border: 1px solid #00ffaa; 
+            padding: 10px; 
+            width: 100%; 
+            box-sizing: border-box;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        button { 
+            background: #00ffaa; 
+            color: #0f141c; 
+            border: none; 
+            padding: 12px 20px; 
+            font-weight: bold; 
+            cursor: pointer; 
+            width: 100%;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #00cc88;
+        }
+        .error { 
+            color: #ff3333; 
+            font-weight: bold;
+            margin-top: 15px;
+        }
+    </style>
+</head>
+<body>
+    <h2>Authoritative Verification Node Interface</h2>
+    <div class="box" id="form-container">
+        <p>Awaiting payload alignment security string token keys...</p>
+    </div>
+
+    <script>
+        const token = new URLSearchParams(window.location.search).get('token');
+        const container = document.getElementById('form-container');
+
+        // Verify token existence immediately on client side without revealing directory details
+        if (!token) {
+            container.innerHTML = "<p class='error'>Access Aborted: Security token parameters are missing from this path initialization.</p>";
+        } else {
+            container.innerHTML = `
+                <label for="pass">Input Isolated Alpha-Numeric Synchronization Password:</label><br><br>
+                <input type="password" id="pass" placeholder="Minimum 8 characters required" autocomplete="new-password">
+                <button onclick="executeReset()">Authorize Changes</button>
+                <p id="err-msg" class="error"></p>
+            `;
+        }
+
+        async function executeReset() {
+            const passwordField = document.getElementById('pass');
+            const password = passwordField.value;
+            const msg = document.getElementById('err-msg');
+            msg.innerText = ""; // Clear existing error messages
+            
+            try {
+                const res = await fetch('/api/recovery/reset-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: token, newPassword: password })
+                });
+                
+                const data = await res.json();
+                
+                if (res.ok) {
+                    // Wipe the sensitive password primitive input string field immediately out of browser memory
+                    passwordField.value = "";
+                    container.innerHTML = `
+                        <h3>Execution Successfully Normalized.</h3>
+                        <p>System confirmation ticket generated code: <strong>${data.receipt}</strong></p>
+                        <p>You may now safely close this browser window session. The voice system is processing confirmation logs.</p>
+                    `;
+                } else {
+                    msg.innerText = `Transaction Exception: [${data.code}] - ${data.description}`;
+                }
+            } catch (err) {
+                msg.innerText = "Transaction Exception: Network payload dispatch failure.";
+            }
+        }
+    </script>
+</body>
+</html>
