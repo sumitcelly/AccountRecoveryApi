@@ -5,12 +5,15 @@ using Azure.Messaging.EventGrid;
 using System.Text.Json;
 using AccountRecoveryApi.Domain;
 using Azure.Communication;
+using AccountRecoveryApi.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // 1. Core Services Setup
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IRecoverySessionEngine, InMemoryRecoveryEngine>();
+builder.Services.AddSingleton<IRecoveryMonitorQueue, RecoveryMonitorQueue>();
+builder.Services.AddHostedService<AccountRecoveryMonitorService>();
 
 // Initialize CallAutomationClient (Gracefully falls back to mock strings for local verification)
 var acsConnectionString = builder.Configuration.GetConnectionString("AzureCommunicationServices") 
@@ -22,8 +25,7 @@ try
 }
 catch (Exception ex)
 {
-    // Fallback instantiation to bypass production verification blocks in isolated test environments
-    Console.WriteLine($"[SANDBOX INITIALIZATION] Local SDK boundary bypass applied. Configuration initialized safely.");
+    Console.Error.WriteLine($"[ACS INITIALIZATION ERROR] Call automation is unavailable: {ex.Message}");
 }
 var app = builder.Build();
 

@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Microsoft.Extensions.Caching.Memory;
 using Azure.Communication.CallAutomation;
+using AccountRecoveryApi.Infrastructure;
 
 namespace AccountRecoveryApi.Domain;
 
@@ -50,12 +51,17 @@ public interface IRecoverySessionEngine
 public class InMemoryRecoveryEngine : IRecoverySessionEngine
 {
     private readonly IMemoryCache _cache;
+
+    private readonly IRecoveryMonitorQueue _queueAccess;
     private const string SessionPrefix = "rec_sess_";
     private const string CallPrefix = "call_idx_";
     private const string TokenPrefix = "tok_idx_";
     private const string InboxPrefix = "inbox_";
 
-    public InMemoryRecoveryEngine(IMemoryCache cache) => _cache = cache;
+    public InMemoryRecoveryEngine(IMemoryCache cache, IRecoveryMonitorQueue queueAccess) {
+        _cache = cache;
+        _queueAccess = queueAccess;
+    }
 
     public void CreateSession(string callConnectionId)
     {
@@ -160,10 +166,8 @@ public class InMemoryRecoveryEngine : IRecoverySessionEngine
         if (connection != null)
         {
             var media = connection.GetCallMedia();
-            // Create a safety cancellation token linked to the session's max expiry
-            var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
             await media.PlayToAllAsync(new TextSource("Identity confirmed. An isolated profile recovery interface link has reached your secure desktop environment workspace. Please process your password alteration privately."));
-            _ = Task.Run(() => MonitorWebResolutionAsync(connection, session.SessionId,cts.Token));
+            _queueAccess.QueueSessionForMonitoring(sessionId);
         }
     }
 }
@@ -190,76 +194,6 @@ public class InMemoryRecoveryEngine : IRecoverySessionEngine
         _cache.Set($"{SessionPrefix}{session.SessionId}", session);
         return new ResetResult { Success = true, ReceiptId = receipt };
     }
-
-    private async Task MonitorWebResolutionAsync(CallConnection connection, string sessionId, 
-    CancellationToken token)
-    {
-    int polls = 0;
-    // Fix: Scale loop bounds to 200 iterations at 3 seconds per poll to fully match your 10-minute (600s) token window
-    const int MaxPolls = 200; 
-    
-    while (polls < MaxPolls) 
-    {
-        try
-        {
-            // Inject cooperative token cancellation directly into the delay call for immediate task eviction
-            await Task.Delay(TimeSpan.FromSeconds(3), token);
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine($"[MONITOR] Web resolution monitoring aborted via token for session: {sessionId}");
-            return;
-        }
-
-        // Defensive Lookup Check
-        if (!_cache.TryGetValue($"{SessionPrefix}{sessionId}", out RecoverySession? session) || session == null)
-        {
-            Console.WriteLine($"[MONITOR ERROR] Active session context {sessionId} evicted or wiped from memory during polling.");
-            return;
-        }
-        
-        // Fast-fail if the status transitioned out-of-band via an external telephony agent or endpoint
-        if (session.State == SessionState.Escalated) 
-        {
-            return;
-        }
-        
-        // Check authoritative web platform validation flags
-        if (session.State == SessionState.Completed && !string.IsNullOrEmpty(session.ResolutionReceipt))
-        {
-            if (connection != null)
-            {
-                try
-                {
-                    var media = connection.GetCallMedia();
-                    var textMessage = $"Transaction completed successfully. System change ticket recorded under identification sequence: {session.ResolutionReceipt}. Thank you.";
-                    
-                    await media.PlayToAllAsync(new TextSource(textMessage) { VoiceName = "en-US-NancyNeural" }, token);
-                    
-                    // Allow full message delivery window before tearing down signaling pipelines
-                    await Task.Delay(TimeSpan.FromSeconds(8), token);
-                    await connection.HangUpAsync(true, token);
-                }
-                catch (Exception ex)
-                {
-                    // Graceful containment for offline sandbox environments and unit testing scenarios
-                    Console.WriteLine($"[TELEPHONY SANDBOX] Intercepted signaling exception during offline execution: {ex.Message}");
-                }
-            }
-            return;
-        }
-        
-        polls++;
-    }
-
-    // Explicit Timeout Handling: Reload the absolute state layer to verify status right at boundary expiration
-    if (_cache.TryGetValue($"{SessionPrefix}{sessionId}", out RecoverySession? currentSession) && currentSession != null)
-    {
-        Console.WriteLine($"[MONITOR TIMEOUT] Session {sessionId} breached structural synchronization window.");
-        await HandleEscalationAsync(connection, currentSession, "Web synchronization timeline lapsed.");
-    }
-}
-
 
 private async Task HandleEscalationAsync(CallConnection connection, RecoverySession session, string message)
 {
