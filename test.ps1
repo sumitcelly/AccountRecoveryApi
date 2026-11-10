@@ -1,115 +1,63 @@
-# PowerShell End-to-End Recovery Journey Integration Test
-$BaseUrl = "http://localhost:5000"
+param(
+    [string]$BaseUrl = "https://localhost:7208"
+)
 
-Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "🚀 STARTING SIMULATED ENTERPRISE ACCOUNT RECOVERY lifecycles" -ForegroundColor Cyan
-Write-Host "==========================================================" -ForegroundColor Cyan
-
-# -------------------------------------------------------------------------
-# STEP A: Simulate Inbound Call Event
-# -------------------------------------------------------------------------
-Write-Host "`n[STEP A] dispatching inbound call event to telephony pipeline..." -ForegroundColor Yellow
-$InboundBody = @(
-    @{
-        eventType = "Microsoft.Communication.IncomingCall"
-        data = @{
-            incomingCallContext = "mock-context-123"
-        }
-    }
-) | ConvertTo-Json -Depth 10
-
-try {
-    $ResA = Invoke-RestMethod -Uri "$BaseUrl/api/telephony/incoming" -Method Post -ContentType "application/json" -Body $InboundBody
-    Write-Host "✅ Telephony Handshake Initialized: Session Provisioned." -ForegroundColor Green
-} catch {
-    Write-Error "❌ Step A Failed: $_"
-    return
+$Username = $env:MOCK_INBOX_USERNAME
+$InboxPassword = $env:MOCK_INBOX_PASSWORD
+if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($InboxPassword)) {
+    throw "Set MOCK_INBOX_USERNAME and MOCK_INBOX_PASSWORD before running this script."
 }
 
-# -------------------------------------------------------------------------
-# STEP B: Input Pre-Enrolled Account Identity (12345) via Keypad
-# -------------------------------------------------------------------------
-Write-Host "`n[STEP B] Simulating user keypad entry for Account: 12345..." -ForegroundColor Yellow
-
-# Format a valid CloudEvent array matching the CallAutomation SDK Event Parser expectations
-# Locate [STEP B] inside your test-recovery.ps1 script and update the $CallbackBody to look exactly like this:
-$CallbackBody = @(
-    @{
-        id = [Guid]::NewGuid().ToString()
-        source = "communications/connections/mock-context-123"
-        type = "Microsoft.Communication.RecognizeCompleted"
-        specversion = "1.0"
-        data = @{
-            callConnectionId = "mock-context-123"
-            recognizeResult = @{
-                # Ensure the subclass is explicitly structured to clear casting checks
-                dtmfResult = @{
-                    tones = @("Tone1", "Tone2", "Tone3", "Tone4", "Tone5")
-                }
-            }
-        }
-    }
-) | ConvertTo-Json -Depth 10
-
-try {
-    $ResB = Invoke-RestMethod -Uri "$BaseUrl/api/telephony/callback" -Method Post -ContentType "application/json" -Body $CallbackBody
-    Write-Host "✅ Keypad Entry Transmitted. State advanced to AwaitingCode." -ForegroundColor Green
-} catch {
-    Write-Error "❌ Step B Failed: $_"
-    return
-}
-
-# -------------------------------------------------------------------------
-# STEP C: Query Out-of-Band Mock Inbox and Extract Security Tokens
-# -------------------------------------------------------------------------
-Write-Host "`n[STEP C] Querying out-of-band mock inbox profile workspace..." -ForegroundColor Yellow
-Start-Sleep -Seconds 1 # Ensure the state engine updates the cache index asynchronously
-
-try {
-    $Inbox = Invoke-RestMethod -Uri "$BaseUrl/api/mock/inbox/12345" -Method Get
-    Write-Host "📬 Out-of-Band Delivery Intercepted Successfully!" -ForegroundColor Green
-    Write-Host "👉 Simulated Mail Verification Code : $($Inbox.lastSentCode)" -ForegroundColor Cyan
-    Write-Host "👉 Simulated High-Entropy Reset Link: $($Inbox.secureResetLink)" -ForegroundColor Cyan
-    
-    # Parse out the raw token parameter from the generated web string link
-    $Token = ($Inbox.secureResetLink -split "token=")[1]
-    Write-Host "👉 Cryptographic Token Extracted  : $Token" -ForegroundColor Cyan
-} catch {
-    Write-Error "❌ Step C Failed: Mock inbox profile entry not found or timed out. $_"
-    return
-}
-
-# -------------------------------------------------------------------------
-# STEP D: Simulate Authoritative HTTPS Browser Reset Submission
-# -------------------------------------------------------------------------
-Write-Host "`n[STEP D] Dispatching isolated HTTPS password alteration request..." -ForegroundColor Yellow
-$ResetBody = @{
-    token = $Token
-    newPassword = "SecureEnterprisePassword2026!"
+$WebSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+$LoginBody = @{
+    username = $Username
+    password = $InboxPassword
 } | ConvertTo-Json
 
 try {
-    $Receipt = Invoke-RestMethod -Uri "$BaseUrl/api/recovery/reset-password" -Method Post -ContentType "application/json" -Body $ResetBody
-    Write-Host "✅ PRIVACY BOUNDARY PASSWORD RESET SUCCESSFUL!" -ForegroundColor Green
-    Write-Host "🎫 Authoritative System Receipt Code: $($Receipt.receipt)" -ForegroundColor Magenta
-    Write-Host "💬 Server Confirmation Message     : $($Receipt.message)" -ForegroundColor Magenta
+    Invoke-RestMethod -Uri "$BaseUrl/api/mock/login" -Method Post `
+        -ContentType "application/json" -Body $LoginBody -WebSession $WebSession | Out-Null
+    $Inbox = Invoke-RestMethod -Uri "$BaseUrl/api/mock/inbox" -Method Get -WebSession $WebSession
 } catch {
-    Write-Error "❌ Step D Failed: Password reset transaction aborted. $_"
+    throw "Inbox sign-in failed. Check the credentials and service URL."
+}
+
+if ($Inbox.verificationCode) {
+    Write-Host "Current synthetic verification code: $($Inbox.verificationCode)" -ForegroundColor Cyan
+}
+if ([string]::IsNullOrWhiteSpace($Inbox.resetLink)) {
+    Write-Host "No reset link is available yet. Complete account and verification-code steps in the live call, then rerun this script."
     return
 }
 
-# -------------------------------------------------------------------------
-# STEP E: Verify Replay Attack Protection (Idempotency Check)
-# -------------------------------------------------------------------------
-Write-Host "`n[STEP E] Testing single-use token token boundary (Replay Defenses)..." -ForegroundColor Yellow
-try {
-    $Replay = Invoke-RestMethod -Uri "$BaseUrl/api/recovery/reset-password" -Method Post -ContentType "application/json" -Body $ResetBody
-    Write-Host "❌ CRITICAL EXPLOIT DETECTED: Token was replayed!" -ForegroundColor Red
-} catch {
-    Write-Host "✅ REPLAY DEFENSE WORKING: Token reuse was successfully blocked by backend." -ForegroundColor Green
-    Write-Host "💬 Expected Security Response: [400 Bad Request] - State connection invalid or replayed." -ForegroundColor Gray
+$ResetUri = [Uri]::new([Uri]::new("$BaseUrl/"), $Inbox.resetLink)
+$Token = [System.Web.HttpUtility]::ParseQueryString($ResetUri.Query).Get("token")
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    throw "The authenticated inbox did not contain a valid reset link."
 }
 
-Write-Host "`n==========================================================" -ForegroundColor Cyan
-Write-Host "🎯 END-TO-END AUTOMATED LIFE CYCLE TESTING COMPLETE" -ForegroundColor Cyan
-Write-Host "==========================================================" -ForegroundColor Cyan
+$SecurePassword = Read-Host "Enter a new synthetic password (minimum 8 characters)" -AsSecureString
+$NewPassword = [PSCredential]::new("unused", $SecurePassword).GetNetworkCredential().Password
+$ResetBody = @{
+    token = $Token
+    newPassword = $NewPassword
+} | ConvertTo-Json
+
+try {
+    $Receipt = Invoke-RestMethod -Uri "$BaseUrl/api/recovery/reset-password" -Method Post `
+        -ContentType "application/json" -Body $ResetBody
+    $Replay = Invoke-RestMethod -Uri "$BaseUrl/api/recovery/reset-password" -Method Post `
+        -ContentType "application/json" -Body $ResetBody
+    if ($Replay.receipt -ne $Receipt.receipt) {
+        throw "The reset retry did not return the original authoritative receipt."
+    }
+
+    Write-Host "Synthetic password reset completed. Receipt: $($Receipt.receipt)" -ForegroundColor Green
+    Write-Host "Idempotent retry returned the same receipt." -ForegroundColor Green
+} finally {
+    $NewPassword = $null
+    $ResetBody = $null
+    $Token = $null
+}
+
+Invoke-RestMethod -Uri "$BaseUrl/api/mock/logout" -Method Post -WebSession $WebSession | Out-Null

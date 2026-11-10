@@ -1,118 +1,67 @@
+# Synthetic Account Recovery API
 
- 1. System Grading Matrix
+This .NET 8 sample demonstrates a recovery flow for synthetic accounts. It is an exercise, not a production identity-proofing system. The mock inbox simulates an independently accessed recovery channel; it does not establish real-world identity assurance.
 
+## Local setup
 
-Category	Targeted Architectural Objectives
-🛡️ Security & Correctness	Anti-enumeration containment loops, secure HTTPS reset path validation, and tamper-evident ticket truth logs (ESC-XXXXXXXX).
-🗣️ Conversation Quality	DTMF determinism mapping (DtmfTone native parsing), non-blocking fail-fast throttling, and clean telemetry handoffs.
-⏱️ Reliability	120-second verification-code expiry, 10-minute reset-link expiry, and hosted background call monitoring.
-🏗️ Engineering Quality	Decoupled Clean Architecture, absolute memory lifecycle isolation, and reproducible local integration testing scripts.
+The project uses SQLite for recovery state, mock inbox deliveries, synthetic credentials, and ASP.NET Core Identity users. The database is created and migrated at application startup. To run migrations manually:
 
+```sh
+dotnet tool restore
+dotnet ef database update
+```
 
-🏗️ 2. Core Architecture & Lifecycles
+Set a local inbox password using User Secrets; do not put it in `appsettings.json` or source control:
 
-The engine decouples telephony signaling routing from the underlying session state memory matrix using clear key-prefixes:
-[ Incoming Telephony Stream ] ──> /api/telephony/callback
-                                         │
-                    ┌────────────────────┴────────────────────┐
-                    ▼                                         ▼
-         [ CallPrefix (call_idx_) ]                [ TokenPrefix (tok_idx_) ]
-                    │                                         │
-                    └────────────────────┬────────────────────┘
-                                         ▼
-                            [ SessionPrefix (rec_sess_) ]
-                                         │
-                                         ▼
-                          MemoryCacheEntryOptions Policies
+```sh
+dotnet user-secrets init
+dotnet user-secrets set "MockInbox:Username" "inbox-user"
+dotnet user-secrets set "MockInbox:Password" "ChangeMe!2026"
+dotnet user-secrets set "MockInbox:AccountId" "12345"
+```
 
-⏱️ Strict Expiration Policies
+Then run the HTTPS launch profile:
 
-• Telephony Session: Initially cached for 15 minutes. Some later state updates use the cache's default expiration, so this is not currently a guaranteed hard cap.
-• Verification Code Window (120 Seconds Hard Cap): Restricts the window for brute-forcing digits over the voice stream.
-• Web Reset Link Window (10 Minutes): The reset-token index expires after 10 minutes, and the reset endpoint also checks the session's link expiry.
+```sh
+dotnet dev-certs https --trust
+dotnet run --launch-profile https
+```
 
-🚀 3. Local Simulation & Integration Testing
+The HTTPS profile listens at `https://localhost:7208`. The reset API rejects non-HTTPS requests outside Development. Development allows HTTP for local tooling, so use the HTTPS URL for the browser and reset flow. Set `ConnectionStrings__RecoveryDatabase` to change the SQLite database location. `BaseUrl` must be set to the externally reachable HTTPS base URL for real ACS callbacks.
 
-Use these reproducible cURL test paths to validate the event parser and state transformations in a local development environment.
+The configured inbox account is pre-enrolled for synthetic account `12345`. The sample also seeds synthetic account `67890`; it has no inbox login unless explicitly mapped in configuration/data.
 
-Phase 1: Simulate Inbound Call Connection
+For the PowerShell API smoke test, set `MOCK_INBOX_USERNAME` and `MOCK_INBOX_PASSWORD` in the shell. First complete the inbound call, account-ID, and verification-code steps with a configured ACS resource. Then run `./test.ps1`; it reads the authenticated inbox, prompts securely for a synthetic password, and verifies that a retry returns the original receipt. For the actual browser flow, use the inbox and reset pages instead.
 
-Simulates an incoming telephone connection hitting the inbound route. This allocates the session context with an initial 15-minute cache expiration.
-bash
-curl -X POST "http://localhost:5000/api/telephony/incoming" \
-  -H "Content-Type: application/cloudevents+json" \
-  -d '[{
-    "specversion": "1.0",
-    "type": "Microsoft.Communication.IncomingCall",
-    "source": "/calling/incomingCall/mock-notification-id",
-    "id": "inc-call-evt-id-999",
-    "time": "2026-11-05T12:00:00Z",
-    "data": {
-      "to": { "rawId": "phone:+18005550199", "phoneNumber": { "value": "+18005550199" } },
-      "from": { "rawId": "phone:+17195550100", "phoneNumber": { "value": "+17195550100" } },
-      "hasIncomingVideo": false,
-      "callConnectionId": "mock-context-123",
-      "serverCallId": "mock-server-call-999",
-      "correlationId": "mock-correlation-777",
-      "incomingCallContext": "mock-jwt-token-string"
-    }
-  }]'
-Use code with caution.
+## Exercise flow
 
-Phase 2: Submit Validated Account Identifier (DTMF Route)
+1. The inbound call handler creates a persisted recovery session and asks for a five-digit synthetic account ID.
+2. The issuer responds with the same voice message whether an account exists or not. For a known account, it persists a six-digit verification code to that account's mock inbox. Unknown accounts never get a delivery.
+3. Open `https://localhost:7208/mock-inbox.html` in a separate browser context and sign in with the pre-enrolled inbox username/password. The inbox API derives account access from the authenticated Identity user; callers cannot choose an account ID in the request.
+4. Enter the complete six-digit code by speech or keypad. Two distinct completed wrong-code events close the recovery attempt. Re-delivery of the same ACS event ID is ignored.
+5. After verification, the issuer stores a high-entropy reset link in that same inbox. The voice prompts do not reveal its code or token.
+6. Open the link and enter a new synthetic password privately in the browser form. The reset backend enforces the minimum-length policy, updates the synthetic credential hash in SQLite, and returns a persisted receipt. Repeating the same successful reset request returns the same receipt and does not apply another password change.
+7. Asking for an agent or representative records a persisted `ESC-...` mock outcome and tells the caller that no human is connected. Verification exhaustion and expired links are also recorded as escalations.
 
-Simulates the caller keying in their numerical identification code using telephone buttons.
-💡 Rubric Note: The Azure SDK parser maps raw values strictly against lowercase spelled out numbers (e.g., "one", "two"). Passing custom variations like "Tone1" will cause serialization to fail silently.
-bash
-curl -X POST "http://localhost:5000/api/telephony/callback" \
-  -H "Content-Type: application/json" \
-  -d '[{
-    "id": "1111",
-    "source": "communications/connections/mock-context-123",
-    "type": "Microsoft.Communication.RecognizeCompleted",
-    "specversion": "1.0",
-    "data": {
-      "callConnectionId": "mock-context-123",
-      "recognitionType": "dtmf",
-      "dtmfResult": {
-        "tones": ["one", "two", "three", "four", "five"]
-      }
-    }
-  }]'
-Use code with caution.
+The browser password necessarily reaches the reset backend over HTTPS. The application does not log password request bodies or recognized caller input. A spoken secret could still be present in raw telephony audio or an external speech service, so this sample asks users to use only synthetic data.
 
-Phase 3: Submit Validated Account Identifier (Speech Route)
+## Persistence and monitoring
 
-Validates the speech recognition alternative code path within the callback processing block.
-bash
-curl -X POST "http://localhost:5000/api/telephony/callback" \
-  -H "Content-Type: application/json" \
-  -d '[{
-    "id": "2222",
-    "source": "communications/connections/mock-context-123",
-    "type": "Microsoft.Communication.RecognizeCompleted",
-    "specversion": "1.0",
-    "data": {
-      "callConnectionId": "mock-context-123",
-      "recognitionType": "speech",
-      "speechResult": {
-        "text": "12345"
-      }
-    }
-  }]'
-Use code with caution.
+- EF Core SQLite migrations persist sessions, verification-code attempt counts and expiry, mock inbox deliveries, synthetic credential hashes, Identity users, account-to-inbox mappings, and processed callback event IDs.
+- Verification state transitions and reset completion run in database transactions. A concurrency version protects session updates; event IDs prevent duplicate callback delivery from counting as another attempt.
+- Reset tokens are generated with 256 bits of randomness. Only a SHA-256 token hash is stored for validation; the raw link is held only as a mock inbox delivery, analogous to an email delivery.
+- The monitor queries persisted `LinkIssued` sessions every three seconds, including after process restart. It tracks link expiry from the database, persists timeout escalation outcomes, and plays a completion/timeout message and hangs up when the call connection is still available.
+- The SQLite database is a single-process demo store. The monitor can recover after a restart, but SQLite and periodic scans are not a substitute for a distributed production database/queue under multi-instance load.
 
-🛡️ 4. Hosted Background Call Monitoring
+## Useful routes
 
-The API registers `AccountRecoveryMonitorService` as a hosted background service and `RecoveryMonitorQueue` as a singleton. After a caller passes the verification-code check and the reset link is issued, the recovery engine enqueues that session for monitoring.
+| Route | Access | Purpose |
+|---|---|---|
+| `POST /api/telephony/incoming` | ACS webhook | Handles Event Grid subscription validation and incoming calls |
+| `POST /api/telephony/callback` | ACS webhook | Processes call recognition and disconnect events |
+| `POST /api/mock/login` | Anonymous | Signs in a pre-enrolled mock inbox user |
+| `GET /api/mock/inbox` | Authenticated inbox cookie | Reads only the signed-in user's inbox |
+| `POST /api/mock/logout` | Authenticated inbox cookie | Signs out |
+| `POST /api/recovery/reset-password` | Reset token | Updates the synthetic credential and returns the authoritative receipt |
 
-`RecoveryMonitorQueue` uses an in-process `ConcurrentQueue<string>`. The hosted service drains it and checks active sessions on a three-second timer:
-
-1. **Successful reset:** When the session reaches `Completed` with a receipt, the worker plays a completion message to the caller, waits five seconds, and hangs up.
-2. **Call disconnected:** When ACS reports the call is no longer connected, the worker stops monitoring that session. The normal call-disconnected callback is responsible for invalidating the session.
-3. **Call-state check error:** The worker logs the error and retries on a later tick instead of treating a transient failure as a confirmed disconnect.
-4. **Monitoring timeout:** After ten minutes or 200 polling iterations, the worker marks the session `Escalated`, removes its call and token index entries, and attempts to play an escalation message.
-
-The monitor is queued only when verification completes with a non-null `CallConnection`. Offline/test paths that pass `null` do not enqueue monitoring.
-
-**Operational limitations:** Both the queue and active-monitor registry are in memory. Restarting the process loses queued and active monitoring work; multiple API instances do not share monitoring state. This is suitable for a local/demo flow, not a durable production job system. For production, use shared persistent session storage and a durable/distributed queue, and make retries and call actions resilient to duplicate processing.
+The telephony webhook routes still need Azure request verification before public exposure. Do not deploy this demo with the mock ACS connection string, local SQLite, or an unauthenticated webhook configuration.

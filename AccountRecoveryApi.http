@@ -1,0 +1,27 @@
+@baseUrl = https://localhost:7208
+@inboxUsername = inbox-user
+@inboxPassword = set-this-in-user-secrets
+
+### Sign in to the pre-enrolled synthetic inbox
+POST {{baseUrl}}/api/mock/login
+Content-Type: application/json
+
+{
+  "username": "{{inboxUsername}}",
+  "password": "{{inboxPassword}}"
+}
+
+### Read only the authenticated user's inbox (requires the login cookie)
+GET {{baseUrl}}/api/mock/inbox
+
+### Sign out
+POST {{baseUrl}}/api/mock/logout
+
+### Submit the secure reset form (replace token with the inbox link token)
+POST {{baseUrl}}/api/recovery/reset-password
+Content-Type: application/json
+
+{
+  "token": "replace-with-the-reset-token",
+  "newPassword": "SyntheticPassword2026!"
+}

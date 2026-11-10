@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Enterprise Credential Synchronization</title>
+    <meta name="referrer" content="no-referrer">
+    <title>Synthetic Account Password Reset</title>
     <style>
         body { 
             font-family: 'Courier New', Courier, monospace; 
@@ -50,9 +51,9 @@
     </style>
 </head>
 <body>
-    <h2>Authoritative Verification Node Interface</h2>
+    <h2>Synthetic Account Password Reset</h2>
     <div class="box" id="form-container">
-        <p>Awaiting payload alignment security string token keys...</p>
+        <p>Checking the reset link...</p>
     </div>
 
     <script>
@@ -61,21 +62,22 @@
 
         // Verify token existence immediately on client side without revealing directory details
         if (!token) {
-            container.innerHTML = "<p class='error'>Access Aborted: Security token parameters are missing from this path initialization.</p>";
+            container.textContent = "This reset link is invalid or missing.";
         } else {
             container.innerHTML = `
-                <label for="pass">Input Isolated Alpha-Numeric Synchronization Password:</label><br><br>
-                <input type="password" id="pass" placeholder="Minimum 8 characters required" autocomplete="new-password">
-                <button onclick="executeReset()">Authorize Changes</button>
+                <label for="pass">New synthetic account password:</label><br><br>
+                <input type="password" id="pass" placeholder="At least 8 characters" autocomplete="new-password" required>
+                <button id="submit-reset">Reset password</button>
                 <p id="err-msg" class="error"></p>
             `;
+            document.getElementById("submit-reset").addEventListener("click", executeReset);
         }
 
         async function executeReset() {
             const passwordField = document.getElementById('pass');
             const password = passwordField.value;
             const msg = document.getElementById('err-msg');
-            msg.innerText = ""; // Clear existing error messages
+            msg.textContent = "";
             
             try {
                 const res = await fetch('/api/recovery/reset-password', {
@@ -87,18 +89,18 @@
                 const data = await res.json();
                 
                 if (res.ok) {
-                    // Wipe the sensitive password primitive input string field immediately out of browser memory
-                    passwordField.value = "";
                     container.innerHTML = `
-                        <h3>Execution Successfully Normalized.</h3>
-                        <p>System confirmation ticket generated code: <strong>${data.receipt}</strong></p>
-                        <p>You may now safely close this browser window session. The voice system is processing confirmation logs.</p>
+                        <h3>Password reset complete</h3>
+                        <p>Receipt: <strong>${data.receipt}</strong></p>
+                        <p>This synthetic account password was updated. You may close this page.</p>
                     `;
                 } else {
-                    msg.innerText = `Transaction Exception: [${data.code}] - ${data.description}`;
+                    msg.textContent = `${data.code}: ${data.description}`;
                 }
             } catch (err) {
-                msg.innerText = "Transaction Exception: Network payload dispatch failure.";
+                msg.textContent = "Unable to contact the recovery service.";
+            } finally {
+                passwordField.value = "";
             }
         }
     </script>

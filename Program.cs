@@ -1,228 +1,338 @@
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Memory;
-using Azure.Communication.CallAutomation;
-using Azure.Messaging.EventGrid;
 using System.Text.Json;
 using AccountRecoveryApi.Domain;
-using Azure.Communication;
 using AccountRecoveryApi.Infrastructure;
+using Azure.Communication;
+using Azure.Communication.CallAutomation;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Core Services Setup
-builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<IRecoverySessionEngine, InMemoryRecoveryEngine>();
-builder.Services.AddSingleton<IRecoveryMonitorQueue, RecoveryMonitorQueue>();
+var connectionString = builder.Configuration.GetConnectionString("RecoveryDatabase")
+    ?? "Data Source=account-recovery.db";
+builder.Services.AddDbContext<RecoveryDbContext>(options => options.UseSqlite(connectionString));
+builder.Services.AddIdentityCore<IdentityUser>(options =>
+    {
+        options.Lockout.MaxFailedAccessAttempts = 5;
+        options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(10);
+        options.Lockout.AllowedForNewUsers = true;
+    })
+    .AddEntityFrameworkStores<RecoveryDbContext>()
+    .AddSignInManager();
+builder.Services
+    .AddAuthentication(IdentityConstants.ApplicationScheme)
+    .AddCookie(IdentityConstants.ApplicationScheme, options =>
+    {
+        options.Cookie.Name = "AccountRecovery.Inbox";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+            ? CookieSecurePolicy.SameAsRequest
+            : CookieSecurePolicy.Always;
+        options.ExpireTimeSpan = TimeSpan.FromMinutes(30);
+        options.SlidingExpiration = true;
+        options.Events.OnRedirectToLogin = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        };
+        options.Events.OnRedirectToAccessDenied = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return Task.CompletedTask;
+        };
+    });
+builder.Services.AddAuthorization();
+builder.Services.AddScoped<IRecoverySessionEngine, RecoverySessionEngine>();
 builder.Services.AddHostedService<AccountRecoveryMonitorService>();
 
-// Initialize CallAutomationClient (Gracefully falls back to mock strings for local verification)
-var acsConnectionString = builder.Configuration.GetConnectionString("AzureCommunicationServices") 
-                          ?? "endpoint=https://azure.com;accesskey=ZXhlY3V0aW9uTmV0d29ya1NhbmRib3hNb2NrS2V5VmFsdWUzMg==";
+var acsConnectionString = builder.Configuration.GetConnectionString("AzureCommunicationServices")
+    ?? "endpoint=https://azure.com;accesskey=ZXhlY3V0aW9uTmV0d29ya1NhbmRib3hNb2NrS2V5VmFsdWUzMg==";
+builder.Services.AddSingleton(new CallAutomationClient(acsConnectionString));
 
-try
-{
-    builder.Services.AddSingleton(new CallAutomationClient(acsConnectionString));
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"[ACS INITIALIZATION ERROR] Call automation is unavailable: {ex.Message}");
-}
 var app = builder.Build();
 
-// 2. Seed Pre-Enrolled Synthetic Enterprise Accounts
-var cache = app.Services.GetRequiredService<IMemoryCache>();
-cache.Set("synthetic_user_12345", new { EmployeeId = "12345", DisplayName = "Test Account Alpha" });
-cache.Set("synthetic_user_67890", new { EmployeeId = "67890", DisplayName = "Test Account Beta" });
+await InitializeDatabaseAsync(app.Services, app.Configuration);
 
-if (!app.Environment.IsDevelopment())
-{
-    app.UseHttpsRedirection();
-}
-app.UseStaticFiles(); // Automatically serves your wwwroot/reset.html form
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseStaticFiles();
+app.MapMockInboxEndpoints();
 
-#region TELEPHONY ENDPOINTS (ACS Webhooks)
-
-// Primary Inbound Call Entry Point
 app.MapPost("/api/telephony/incoming", async (
-    [FromBody] JsonElement[] jsonEvents, 
+    [FromBody] JsonElement[] jsonEvents,
     [FromServices] CallAutomationClient client,
-    [FromServices] IRecoverySessionEngine engine) =>
+    [FromServices] IRecoverySessionEngine engine,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
 {
-    // Handle Event Grid handshakes and parse incoming telephony loops safely
     foreach (var jsonEvent in jsonEvents)
     {
-        if (!jsonEvent.TryGetProperty("eventType", out var eventTypeProp)) continue;
-        var eventType = eventTypeProp.GetString();
+        if (!jsonEvent.TryGetProperty("eventType", out var eventTypeProp))
+        {
+            continue;
+        }
 
-        // Standard Event Grid subscription confirmation handshake validation
+        var eventType = eventTypeProp.GetString();
         if (eventType == "Microsoft.EventGrid.SubscriptionValidationEvent")
         {
             var validationCode = jsonEvent.GetProperty("data").GetProperty("validationCode").GetString();
             return Results.Ok(new { validationResponse = validationCode });
         }
 
-        if (eventType == "Microsoft.Communication.IncomingCall")
+        if (eventType != "Microsoft.Communication.IncomingCall")
         {
-            var incomingCallContext = jsonEvent.GetProperty("data").GetProperty("incomingCallContext").GetString();
-            var callbackUri = new Uri($"{app.Configuration["BaseUrl"] ?? "https://localhost:5001"}/api/telephony/callback");
-            
-            try
-            {
-                var answerResult = await client.AnswerCallAsync(incomingCallContext, callbackUri);
-                var connectionId = answerResult.Value.CallConnection.CallConnectionId;
+            continue;
+        }
 
-                // Provision a strictly locked recovery state bound to this specific call connection channel
-                engine.CreateSession(connectionId);
-                
-                // Prompt user for their account identification tag immediately
-                await PromptForAccountIdentifierAsync(client.GetCallConnection(connectionId));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[TELEPHONY SANDBOX] Intercepted network routing loop safely. Initializing offline test states.");
-    
-                // Explicitly seed the exact unique identifier your PowerShell harness expects
-                engine.CreateSession("mock-context-123");
-                //Console.WriteLine($"[TELEPHONY ERROR] Failed to answer inbound channel call: {ex.Message}");
-            }
+        var incomingCallContext = jsonEvent.GetProperty("data")
+            .GetProperty("incomingCallContext").GetString();
+        if (string.IsNullOrWhiteSpace(incomingCallContext))
+        {
+            return Results.BadRequest();
+        }
+
+        try
+        {
+            var callbackUri = new Uri(
+                $"{app.Configuration["BaseUrl"] ?? "https://localhost:7208"}/api/telephony/callback");
+            var answerResult = await client.AnswerCallAsync(incomingCallContext, callbackUri, cancellationToken);
+            var connectionId = answerResult.Value.CallConnection.CallConnectionId;
+            await engine.CreateSessionAsync(connectionId, cancellationToken);
+            await PromptForAccountIdentifierAsync(client.GetCallConnection(connectionId), cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Unable to initialize the incoming recovery call.");
+            return Results.Problem(
+                title: "Unable to initialize call",
+                statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     }
+
     return Results.Ok();
 });
 
-// Call Action State Continuity & Audio Event Router
 app.MapPost("/api/telephony/callback", async (
     [FromBody] JsonElement[] cloudEvents,
     [FromServices] CallAutomationClient client,
-    [FromServices] IRecoverySessionEngine engine) =>
+    [FromServices] IRecoverySessionEngine engine,
+    ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
 {
-    Console.WriteLine("in call back");
     foreach (var cloudEvent in cloudEvents)
     {
-        // Convert to CloudEvent array raw format to parse via the CallAutomation SDK parser tool
-        var rawJson = cloudEvent.GetRawText();
-        var callEvent = CallAutomationEventParser.Parse(BinaryData.FromString(rawJson));
-       // Console.WriteLine("call event json "+rawJson);
-        if (callEvent == null) continue;
-        
-        Console.WriteLine("call event is "+callEvent.GetType().Name);
+        if (!cloudEvent.TryGetProperty("id", out var idProperty) ||
+            string.IsNullOrWhiteSpace(idProperty.GetString()))
+        {
+            logger.LogWarning("Ignored a call event without an event ID.");
+            continue;
+        }
 
-        var connectionId = callEvent.CallConnectionId;
-        var connection = client.GetCallConnection(connectionId);
-        var session = engine.GetByCallId(connectionId);
-        
-        if (session == null) continue;
-      
+        var callEvent = CallAutomationEventParser.Parse(
+            BinaryData.FromString(cloudEvent.GetRawText()));
+        if (callEvent is null)
+        {
+            continue;
+        }
+
+        var session = await engine.GetByCallIdAsync(callEvent.CallConnectionId, cancellationToken);
+        if (session is null)
+        {
+            continue;
+        }
+
         if (callEvent is RecognizeCompleted recognizeCompleted)
         {
-            Console.WriteLine("In recognized event"+recognizeCompleted.RecognizeResult );
-            string cleanInput = string.Empty;
+            var input = recognizeCompleted.RecognizeResult switch
+            {
+                DtmfResult dtmfResult => string.Concat(
+                    dtmfResult.Tones
+                        .Where(tone => tone != DtmfTone.Pound)
+                        .Select(tone => tone.ToString().Replace("Tone", ""))),
+                SpeechResult speechResult => speechResult.Speech,
+                _ => string.Empty
+            };
 
-            // Correctly differentiate between DTMF pad tones or Spoken Speech inputs natively
-            if (recognizeCompleted.RecognizeResult is DtmfResult dtmfResult)
+            CallConnection? connection = null;
+            try
             {
-                Console.WriteLine("In dtmf");
-                cleanInput = string.Join("", dtmfResult.Tones.Select(t => t.ToString().Replace("Tone", "")));
+                connection = client.GetCallConnection(callEvent.CallConnectionId);
             }
-            else if (recognizeCompleted.RecognizeResult is SpeechResult speechResult)
+            catch (Exception ex)
             {
-                  Console.WriteLine("In speech");
-                
-                cleanInput = speechResult.Speech;
+                logger.LogWarning(ex, "Could not obtain call connection for callback.");
             }
 
-            Console.WriteLine("input is "+cleanInput);
-            // Propose data entry to the isolated state machine engine layer
-            try 
-            {
-                await engine.ProcessCallInputAsync(session.SessionId, cleanInput, connection);
-            }
-            catch
-            {
-                // Local Sandbox Driver Fallback Mode: Trigger state mutations offline without needing active network sockets
-                await engine.ProcessCallInputAsync(session.SessionId, cleanInput, null!);
-            }
+            await engine.ProcessCallInputAsync(
+                session.SessionId,
+                input,
+                idProperty.GetString()!,
+                connection,
+                cancellationToken);
         }
-        
-        if (callEvent is RecognizeFailed || callEvent is PlayFailed)
+        else if (callEvent is CallDisconnected)
         {
-            // Fallback strategy for ambiguous inputs or silence timeouts
-            await PromptForAccountIdentifierAsync(connection);
+            await engine.MarkCallDisconnectedAsync(session.SessionId, cancellationToken);
         }
-
-        if (callEvent is CallDisconnected)
+        else if (callEvent is RecognizeFailed or PlayFailed)
         {
-            // Erase in-memory data footprint instantly upon drop or hang-up to ensure security
-            engine.InvalidateSession(session.SessionId);
+            try
+            {
+                var connection = client.GetCallConnection(callEvent.CallConnectionId);
+                await PromptForRecoveryInputAsync(connection, session.State, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Unable to restart recognition for the recovery call.");
+            }
         }
     }
+
     return Results.Ok();
 });
 
-#endregion
-
-#region SECURITY ISOLATED RESET ENDPOINTS
-
-// Authoritative HTTPS Reset Action (Isolated from Model/Speech Infrastructure)
 app.MapPost("/api/recovery/reset-password", async (
-    [FromBody] ResetRequest request, 
-    [FromServices] IRecoverySessionEngine engine) =>
+    [FromBody] ResetRequest request,
+    HttpContext context,
+    [FromServices] IRecoverySessionEngine engine,
+    CancellationToken cancellationToken) =>
 {
-    if (string.IsNullOrWhiteSpace(request.NewPassword))
+    context.Response.Headers.CacheControl = "no-store";
+    if (!context.Request.IsHttps && !app.Environment.IsDevelopment())
     {
-        return Results.BadRequest(new { code = "ERR_PASSWORD_EMPTY", description = "Password input cannot be empty." });
+        return Results.BadRequest(new
+        {
+            code = "ERR_HTTPS_REQUIRED",
+            description = "Submit the reset request over HTTPS."
+        });
     }
 
-    // Process secure state mutation within the isolated backend domain controller engine
-    var result = await engine.ExecuteAuthoritativeResetAsync(request.Token, request.NewPassword);
-    
+    if (string.IsNullOrWhiteSpace(request.Token) || string.IsNullOrWhiteSpace(request.NewPassword))
+    {
+        return Results.BadRequest(new
+        {
+            code = "ERR_REQUEST_INVALID",
+            description = "A reset token and new password are required."
+        });
+    }
+
+    var result = await engine.ExecuteAuthoritativeResetAsync(
+        request.Token,
+        request.NewPassword,
+        cancellationToken);
     if (!result.Success)
     {
-        // Deliver only safe, general validation descriptions to the consumer tier
-        return Results.Json(new { code = result.ErrorCode, description = result.ErrorDescription }, statusCode: 400);
+        return Results.Json(
+            new { code = result.ErrorCode, description = result.ErrorDescription },
+            statusCode: StatusCodes.Status400BadRequest);
     }
 
-    return Results.Ok(new { receipt = result.ReceiptId, message = "Credential synchronization executed successfully." });
-});
-
-// Developer/Assessor Mock Inbox Endpoint to view code deliveries out-of-band
-app.MapGet("/api/mock/inbox/{accountId}", (string accountId, [FromServices] IRecoverySessionEngine engine) =>
-{
-    var activeInbox = engine.GetMockInbox(accountId);
-    if (activeInbox == null) return Results.NotFound(new { message = "No active out-of-band deliveries found for this identity token." });
-    return Results.Ok(activeInbox);
-});
-
-#endregion
+    return Results.Ok(new { receipt = result.ReceiptId, message = "Synthetic credential reset completed." });
+})
+.WithSummary("Reset the synthetic account credential with a verified single-use link");
 
 app.Run();
 
-#region CORRECTIONS PLUMBING AUDIO HELPERS
-static async Task PromptForAccountIdentifierAsync(CallConnection connection)
+static async Task InitializeDatabaseAsync(IServiceProvider services, IConfiguration configuration)
 {
-    var media = connection.GetCallMedia();
-    var prompt = new TextSource("Welcome to the automated account recovery system. Please input your numerical employee identity tag followed by the pound key.")
+    await using var scope = services.CreateAsyncScope();
+    var db = scope.ServiceProvider.GetRequiredService<RecoveryDbContext>();
+    await db.Database.MigrateAsync();
+
+    var accounts = new[]
     {
-        VoiceName = "en-US-NancyNeural" // Explicitly target an Azure Neural speech voice asset
+        new SyntheticAccount { AccountId = "12345", DisplayName = "Test Account Alpha" },
+        new SyntheticAccount { AccountId = "67890", DisplayName = "Test Account Beta" }
     };
-    
-    // Rigorously enforce DTMF numerical collection constraints
-    var recognizeOptions = new CallMediaRecognizeDtmfOptions(
-        targetParticipant: CommunicationIdentifier.FromRawId(connection.CallConnectionId), 
-        maxTonesToCollect: 5) 
+    foreach (var account in accounts)
+    {
+        if (!await db.SyntheticAccounts.AnyAsync(item => item.AccountId == account.AccountId))
+        {
+            db.SyntheticAccounts.Add(account);
+        }
+    }
+    await db.SaveChangesAsync();
+
+    var username = configuration["MockInbox:Username"] ?? "inbox-user";
+    var password = configuration["MockInbox:Password"];
+    var accountId = configuration["MockInbox:AccountId"] ?? "12345";
+    if (string.IsNullOrWhiteSpace(password))
+    {
+        throw new InvalidOperationException(
+            "Configure MockInbox:Password with user-secrets or an environment variable before starting the API.");
+    }
+    if (!await db.SyntheticAccounts.AnyAsync(account => account.AccountId == accountId))
+    {
+        throw new InvalidOperationException("MockInbox:AccountId must identify a seeded synthetic account.");
+    }
+
+    var userManager = scope.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
+    var user = await userManager.FindByNameAsync(username);
+    if (user is null)
+    {
+        user = new IdentityUser { UserName = username, EmailConfirmed = true };
+        var createResult = await userManager.CreateAsync(user, password);
+        if (!createResult.Succeeded)
+        {
+            var errors = string.Join("; ", createResult.Errors.Select(error => error.Code));
+            throw new InvalidOperationException($"Unable to create the configured mock inbox user: {errors}");
+        }
+    }
+
+    var inboxMapping = await db.InboxAccounts.SingleOrDefaultAsync(item => item.UserId == user.Id);
+    if (inboxMapping is null)
+    {
+        db.InboxAccounts.Add(new InboxAccount { UserId = user.Id, AccountId = accountId });
+    }
+    else
+    {
+        inboxMapping.AccountId = accountId;
+    }
+
+    await db.SaveChangesAsync();
+}
+
+static async Task PromptForAccountIdentifierAsync(
+    CallConnection connection,
+    CancellationToken cancellationToken) =>
+    await PromptForRecoveryInputAsync(connection, SessionState.AwaitingId, cancellationToken);
+
+static async Task PromptForRecoveryInputAsync(
+    CallConnection connection,
+    SessionState state,
+    CancellationToken cancellationToken)
+{
+    if (state is not (SessionState.AwaitingId or SessionState.AwaitingCode))
+    {
+        return;
+    }
+
+    var awaitingAccountId = state == SessionState.AwaitingId;
+    var prompt = new TextSource(awaitingAccountId
+        ? "Please enter your five-digit synthetic account identifier."
+        : "Please enter the complete six-digit verification code.")
+    {
+        VoiceName = "en-US-NancyNeural"
+    };
+
+    var recognizeOptions = new CallMediaRecognizeSpeechOrDtmfOptions(
+        targetParticipant: CommunicationIdentifier.FromRawId(connection.CallConnectionId),
+        maxTonesToCollect: awaitingAccountId ? 5 : 6)
     {
         InitialSilenceTimeout = TimeSpan.FromSeconds(10),
         InterToneTimeout = TimeSpan.FromSeconds(4),
-        // Stable property configuration assignments:
+        EndSilenceTimeout = TimeSpan.FromSeconds(2),
+        SpeechLanguage = "en-US",
         Prompt = prompt,
         InterruptPrompt = true,
-        StopTones = new[] { DtmfTone.Pound } 
+        StopTones = new[] { DtmfTone.Pound }
     };
 
-    await media.StartRecognizingAsync(recognizeOptions);
+    await connection.GetCallMedia().StartRecognizingAsync(recognizeOptions, cancellationToken);
 }
 
-
-#endregion
-
-public record ResetRequest(string Token, string NewPassword);
+/// <summary>Token and new synthetic password submitted by the reset form.</summary>
+public sealed record ResetRequest(string Token, string NewPassword);

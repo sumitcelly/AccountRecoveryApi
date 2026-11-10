@@ -1,35 +1,44 @@
 using System.Security.Cryptography;
-using Microsoft.Extensions.Caching.Memory;
-using Azure.Communication.CallAutomation;
+using System.Text;
+using System.Text.RegularExpressions;
 using AccountRecoveryApi.Infrastructure;
+using Azure.Communication;
+using Azure.Communication.CallAutomation;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 
 namespace AccountRecoveryApi.Domain;
 
 public enum SessionState { AwaitingId, AwaitingCode, CodeVerified, LinkIssued, Completed, Escalated }
 
-public class RecoverySession
+public sealed class RecoverySession
 {
     public string SessionId { get; set; } = null!;
     public string? AccountId { get; set; }
-    public bool IsRealAccount { get; set; } = false; // Anti-enumeration security shield
-    public string CallConnectionId { get; set; } = null!;
-    public string? VerificationCode { get; set; }
+    public bool IsRealAccount { get; set; }
+    public string? CallConnectionId { get; set; }
+    public string? VerificationCodeHash { get; set; }
     public int CodeAttempts { get; set; }
     public DateTime CodeExpiry { get; set; }
-    public string? ResetToken { get; set; }
+    public string? ResetTokenHash { get; set; }
     public DateTime LinkExpiry { get; set; }
     public SessionState State { get; set; }
     public string? ResolutionReceipt { get; set; }
+    public string? EscalationReason { get; set; }
+    public long Version { get; set; }
 }
 
-public class MockInboxFixture
+public sealed class MockInboxFixture
 {
+    public string AccountId { get; set; } = null!;
     public string? LastSentCode { get; set; }
     public string? SecureResetLink { get; set; }
     public DateTime Timestamp { get; set; }
+    public DateTime? CodeExpiresAt { get; set; }
+    public DateTime? LinkExpiresAt { get; set; }
 }
 
-public class ResetResult
+public sealed class ResetResult
 {
     public bool Success { get; set; }
     public string? ReceiptId { get; set; }
@@ -39,182 +48,447 @@ public class ResetResult
 
 public interface IRecoverySessionEngine
 {
-    void CreateSession(string callConnectionId);
-    RecoverySession? GetByCallId(string callConnectionId);
-    RecoverySession? GetByResetToken(string token);
-    MockInboxFixture? GetMockInbox(string accountId);
-    void InvalidateSession(string sessionId);
-    Task ProcessCallInputAsync(string sessionId, string input, CallConnection connection);
-    Task<ResetResult> ExecuteAuthoritativeResetAsync(string token, string rawPassword);
+    Task CreateSessionAsync(string callConnectionId, CancellationToken cancellationToken = default);
+    Task<RecoverySession?> GetByCallIdAsync(string callConnectionId, CancellationToken cancellationToken = default);
+    Task<MockInboxFixture?> GetMockInboxForUserAsync(string userId, CancellationToken cancellationToken = default);
+    Task MarkCallDisconnectedAsync(string sessionId, CancellationToken cancellationToken = default);
+    Task<bool> ProcessCallInputAsync(
+        string sessionId,
+        string input,
+        string eventId,
+        CallConnection? connection,
+        CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RecoverySession>> GetPendingMonitoringSessionsAsync(CancellationToken cancellationToken = default);
+    Task<RecoverySession?> GetSessionAsync(string sessionId, CancellationToken cancellationToken = default);
+    Task<bool> ExpireSessionAsync(string sessionId, CancellationToken cancellationToken = default);
+    Task<ResetResult> ExecuteAuthoritativeResetAsync(
+        string token,
+        string rawPassword,
+        CancellationToken cancellationToken = default);
 }
 
-public class InMemoryRecoveryEngine : IRecoverySessionEngine
+public sealed class RecoverySessionEngine(
+    RecoveryDbContext db,
+    IPasswordHasher<IdentityUser> passwordHasher,
+    ILogger<RecoverySessionEngine> logger) : IRecoverySessionEngine
 {
-    private readonly IMemoryCache _cache;
+    private static readonly TimeSpan VerificationLifetime = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan ResetLinkLifetime = TimeSpan.FromMinutes(10);
 
-    private readonly IRecoveryMonitorQueue _queueAccess;
-    private const string SessionPrefix = "rec_sess_";
-    private const string CallPrefix = "call_idx_";
-    private const string TokenPrefix = "tok_idx_";
-    private const string InboxPrefix = "inbox_";
-
-    public InMemoryRecoveryEngine(IMemoryCache cache, IRecoveryMonitorQueue queueAccess) {
-        _cache = cache;
-        _queueAccess = queueAccess;
-    }
-
-    public void CreateSession(string callConnectionId)
+    public async Task CreateSessionAsync(string callConnectionId, CancellationToken cancellationToken = default)
     {
-        var sessionId = Guid.NewGuid().ToString();
-        var session = new RecoverySession { SessionId = sessionId, CallConnectionId = callConnectionId, State = SessionState.AwaitingId };
-        _cache.Set($"{SessionPrefix}{sessionId}", session, TimeSpan.FromMinutes(15));
-        _cache.Set($"{CallPrefix}{callConnectionId}", sessionId, TimeSpan.FromMinutes(15));
-    }
-
-    public RecoverySession? GetByCallId(string callConnectionId) =>
-        _cache.TryGetValue($"{CallPrefix}{callConnectionId}", out string? sid) ? _cache.Get<RecoverySession>($"{SessionPrefix}{sid}") : null;
-
-    public RecoverySession? GetByResetToken(string token) =>
-        _cache.TryGetValue($"{TokenPrefix}{token}", out string? sid) ? _cache.Get<RecoverySession>($"{SessionPrefix}{sid}") : null;
-
-    public MockInboxFixture? GetMockInbox(string accountId) => _cache.Get<MockInboxFixture>($"{InboxPrefix}{accountId}");
-
-    public void InvalidateSession(string sessionId)
-    {
-        if (_cache.TryGetValue($"{SessionPrefix}{sessionId}", out RecoverySession? session))
+        db.RecoverySessions.Add(new RecoverySession
         {
-            _cache.Remove($"{SessionPrefix}{sessionId}");
-            _cache.Remove($"{CallPrefix}{session!.CallConnectionId}");
-            if (session.ResetToken != null) _cache.Remove($"{TokenPrefix}{session.ResetToken}");
-        }
+            SessionId = Guid.NewGuid().ToString("N"),
+            CallConnectionId = callConnectionId,
+            State = SessionState.AwaitingId,
+            CodeExpiry = DateTime.UtcNow,
+            LinkExpiry = DateTime.UtcNow
+        });
+        await db.SaveChangesAsync(cancellationToken);
     }
 
-    public async Task ProcessCallInputAsync(string sessionId, string input, CallConnection connection)
-    {
-    var session = _cache.Get<RecoverySession>($"{SessionPrefix}{sessionId}");
-    if (session == null || session.State == SessionState.Escalated || session.State == SessionState.Completed) return;
+    public Task<RecoverySession?> GetByCallIdAsync(
+        string callConnectionId,
+        CancellationToken cancellationToken = default) =>
+        db.RecoverySessions.SingleOrDefaultAsync(
+            session => session.CallConnectionId == callConnectionId,
+            cancellationToken);
 
-    // PHASE 1: Account Identification Input
-    if (session.State == SessionState.AwaitingId)
+    public async Task<MockInboxFixture?> GetMockInboxForUserAsync(
+        string userId,
+        CancellationToken cancellationToken = default)
     {
-        session.AccountId = input;
-        session.IsRealAccount = _cache.TryGetValue($"synthetic_user_{input}", out _);
-        
-        session.VerificationCode = RandomNumberGenerator.GetInt32(100000, 999999).ToString();
-        session.CodeExpiry = DateTime.UtcNow.AddSeconds(120);
-        session.State = SessionState.AwaitingCode;
-
-        if (session.IsRealAccount)
+        var mapping = await db.InboxAccounts.AsNoTracking()
+            .SingleOrDefaultAsync(item => item.UserId == userId, cancellationToken);
+        if (mapping is null)
         {
-            var mockInbox = new MockInboxFixture { LastSentCode = session.VerificationCode, Timestamp = DateTime.UtcNow };
-            _cache.Set($"{InboxPrefix}{session.AccountId}", mockInbox, TimeSpan.FromMinutes(12));
+            return null;
         }
 
-        _cache.Set($"{SessionPrefix}{sessionId}", session, TimeSpan.FromMinutes(15));
-
-        // Fix: Null-guard the telephony media layout for offline mock payloads
-        if (connection != null)
+        var inbox = await db.MockInboxes
+            .SingleOrDefaultAsync(item => item.AccountId == mapping.AccountId, cancellationToken);
+        if (inbox is null)
         {
-            var media = connection.GetCallMedia();
-            await media.PlayToAllAsync(new TextSource("A verification token has been routed to your registered security inbox channel. Please speak or enter that six-digit code now."));
+            return new MockInboxFixture { AccountId = mapping.AccountId };
         }
-        return;
+
+        var now = DateTime.UtcNow;
+        var changed = false;
+        if (inbox.CodeExpiresAt <= now)
+        {
+            changed |= inbox.LastSentCode is not null;
+            inbox.LastSentCode = null;
+            inbox.CodeExpiresAt = null;
+        }
+        if (inbox.LinkExpiresAt <= now)
+        {
+            changed |= inbox.SecureResetLink is not null;
+            inbox.SecureResetLink = null;
+            inbox.LinkExpiresAt = null;
+        }
+        if (changed)
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
+        return inbox;
     }
 
-    // PHASE 2: Challenge Code Input Processing
-    if (session.State == SessionState.AwaitingCode)
+    public async Task MarkCallDisconnectedAsync(
+        string sessionId,
+        CancellationToken cancellationToken = default)
     {
-        if (DateTime.UtcNow > session.CodeExpiry)
+        var session = await db.RecoverySessions.SingleOrDefaultAsync(
+            item => item.SessionId == sessionId,
+            cancellationToken);
+        if (session is null)
         {
-            await HandleEscalationAsync(connection, session, "Verification challenge token window expired.");
             return;
         }
 
-        if (!session.IsRealAccount || session.VerificationCode != input)
+        if (session.State is SessionState.AwaitingId or SessionState.AwaitingCode)
         {
-            session.CodeAttempts++;
-            if (session.CodeAttempts >= 2)
+            Escalate(session, "Caller disconnected before verification completed.");
+            session.VerificationCodeHash = null;
+            await ClearInboxDeliveryAsync(session.AccountId, cancellationToken);
+        }
+        session.CallConnectionId = null;
+        session.Version++;
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task<bool> ProcessCallInputAsync(
+        string sessionId,
+        string input,
+        string eventId,
+        CallConnection? connection,
+        CancellationToken cancellationToken = default)
+    {
+        string? prompt = null;
+        var now = DateTime.UtcNow;
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        if (await db.ProcessedCallEvents.AnyAsync(
+                item => item.EventId == eventId,
+                cancellationToken))
+        {
+            return false;
+        }
+
+        var session = await db.RecoverySessions.SingleOrDefaultAsync(
+            item => item.SessionId == sessionId,
+            cancellationToken);
+        if (session is null || session.State is SessionState.Escalated or SessionState.Completed)
+        {
+            return false;
+        }
+
+        db.ProcessedCallEvents.Add(new ProcessedCallEvent { EventId = eventId, SessionId = sessionId });
+
+        if (IsHumanRequest(input))
+        {
+            Escalate(session, "Caller requested human support.");
+            await ClearInboxDeliveryAsync(session.AccountId, cancellationToken);
+            prompt = "Your request has been recorded. No human agent is connected to this exercise. Please contact support for assistance.";
+        }
+        else if (session.State == SessionState.AwaitingId)
+        {
+            var accountId = NormalizeDigits(input);
+            var account = await db.SyntheticAccounts.AsNoTracking()
+                .SingleOrDefaultAsync(item => item.AccountId == accountId, cancellationToken);
+            var code = RandomNumberGenerator.GetInt32(100_000, 1_000_000).ToString();
+
+            session.AccountId = accountId;
+            session.IsRealAccount = account is not null;
+            session.VerificationCodeHash = Hash(code);
+            session.CodeAttempts = 0;
+            session.CodeExpiry = now.Add(VerificationLifetime);
+            session.State = SessionState.AwaitingCode;
+
+            if (account is not null)
             {
-                await HandleEscalationAsync(connection, session, "Maximum sequence validation failures achieved.");
-                return;
+                var inbox = await db.MockInboxes.FindAsync([accountId], cancellationToken)
+                    ?? new MockInboxFixture { AccountId = accountId };
+                inbox.LastSentCode = code;
+                inbox.SecureResetLink = null;
+                inbox.Timestamp = now;
+                inbox.CodeExpiresAt = session.CodeExpiry;
+                inbox.LinkExpiresAt = null;
+                db.MockInboxes.Update(inbox);
             }
 
-            _cache.Set($"{SessionPrefix}{sessionId}", session);
+            prompt = "If the supplied account is eligible, a verification code has been sent to its registered recovery inbox. Enter the six-digit code to continue.";
+        }
+        else if (session.State == SessionState.AwaitingCode)
+        {
+            var normalizedCode = NormalizeCode(input);
+            if (session.CodeExpiry <= now)
+            {
+                Escalate(session, "Verification code expired.");
+                await ClearInboxDeliveryAsync(session.AccountId, cancellationToken);
+                prompt = "Your verification code has expired. For your security, this recovery attempt is closed. Please start again or contact support.";
+            }
+            else if (normalizedCode is null)
+            {
+                prompt = "Please enter the complete six-digit verification code.";
+            }
+            else if (!session.IsRealAccount ||
+                     session.VerificationCodeHash != Hash(normalizedCode))
+            {
+                session.CodeAttempts++;
+                if (session.CodeAttempts >= 2)
+                {
+                    Escalate(session, "Verification attempts exhausted.");
+                    await ClearInboxDeliveryAsync(session.AccountId, cancellationToken);
+                    prompt = "The verification attempt limit has been reached. This recovery attempt is closed. Please contact support.";
+                }
+                else
+                {
+                    prompt = "That verification code was not accepted. Please enter the complete six-digit code again.";
+                }
+            }
+            else
+            {
+                var rawToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+                session.VerificationCodeHash = null;
+                session.ResetTokenHash = Hash(rawToken);
+                session.LinkExpiry = now.Add(ResetLinkLifetime);
+                session.State = SessionState.LinkIssued;
+                var inbox = await db.MockInboxes.FindAsync([session.AccountId!], cancellationToken)
+                    ?? new MockInboxFixture { AccountId = session.AccountId! };
+                inbox.SecureResetLink = $"/reset.html?token={rawToken}";
+                inbox.Timestamp = now;
+                inbox.LinkExpiresAt = session.LinkExpiry;
+                db.MockInboxes.Update(inbox);
 
-            // Fix: Null-guard the telephony media layout for offline mock payloads
-            if (connection != null)
+                prompt = "Your verification is complete. A secure reset link has been sent to your registered recovery inbox. Please open it in a browser to continue.";
+            }
+        }
+
+        session.Version++;
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+
+        if (connection is not null && prompt is not null)
+        {
+            try
             {
                 var media = connection.GetCallMedia();
-                await media.PlayToAllAsync(new TextSource("Invalid credentials entry recorded. Please repeat your security token parameter code."));
+                if (session.State is SessionState.AwaitingId or SessionState.AwaitingCode)
+                {
+                    var recognizeOptions = new CallMediaRecognizeSpeechOrDtmfOptions(
+                        CommunicationIdentifier.FromRawId(connection.CallConnectionId),
+                        maxTonesToCollect: session.State == SessionState.AwaitingId ? 5 : 6)
+                    {
+                        Prompt = new TextSource(prompt),
+                        SpeechLanguage = "en-US",
+                        InitialSilenceTimeout = TimeSpan.FromSeconds(10),
+                        InterToneTimeout = TimeSpan.FromSeconds(4),
+                        EndSilenceTimeout = TimeSpan.FromSeconds(2),
+                        StopTones = new[] { DtmfTone.Pound }
+                    };
+                    await media.StartRecognizingAsync(recognizeOptions, cancellationToken);
+                }
+                else
+                {
+                    await media.PlayToAllAsync(new TextSource(prompt), cancellationToken);
+                    if (session.State == SessionState.Escalated)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(6), cancellationToken);
+                        await connection.HangUpAsync(true, cancellationToken);
+                    }
+                }
             }
-            return;
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Unable to play recovery prompt for session {SessionId}.", sessionId);
+            }
         }
 
-        // Phase 3: Successful Verification -> Link Generation
-        session.State = SessionState.CodeVerified;
-        session.ResetToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-        session.LinkExpiry = DateTime.UtcNow.AddMinutes(10);
-        session.State = SessionState.LinkIssued;
-
-        var currentInbox = _cache.Get<MockInboxFixture>($"{InboxPrefix}{session.AccountId}") ?? new MockInboxFixture();
-        currentInbox.SecureResetLink = $"/reset.html?token={session.ResetToken}";
-        _cache.Set($"{InboxPrefix}{session.AccountId}", currentInbox, TimeSpan.FromMinutes(10));
-        _cache.Set($"{TokenPrefix}{session.ResetToken}", session.SessionId, TimeSpan.FromMinutes(10));
-        _cache.Set($"{SessionPrefix}{sessionId}", session, TimeSpan.FromMinutes(15));
-
-        // Fix: Null-guard the telephony media layout for offline mock payloads
-        if (connection != null)
-        {
-            var media = connection.GetCallMedia();
-            await media.PlayToAllAsync(new TextSource("Identity confirmed. An isolated profile recovery interface link has reached your secure desktop environment workspace. Please process your password alteration privately."));
-            _queueAccess.QueueSessionForMonitoring(sessionId);
-        }
+        return true;
     }
-}
 
+    public async Task<IReadOnlyList<RecoverySession>> GetPendingMonitoringSessionsAsync(
+        CancellationToken cancellationToken = default) =>
+        await db.RecoverySessions.AsNoTracking()
+            .Where(session => session.State == SessionState.LinkIssued)
+            .ToListAsync(cancellationToken);
 
-    public async Task<ResetResult> ExecuteAuthoritativeResetAsync(string token, string rawPassword)
+    public Task<RecoverySession?> GetSessionAsync(
+        string sessionId,
+        CancellationToken cancellationToken = default) =>
+        db.RecoverySessions.AsNoTracking()
+            .SingleOrDefaultAsync(session => session.SessionId == sessionId, cancellationToken);
+
+    public async Task<bool> ExpireSessionAsync(
+        string sessionId,
+        CancellationToken cancellationToken = default)
     {
-        var session = GetByResetToken(token);
-        if (session == null || DateTime.UtcNow > session.LinkExpiry || session.State != SessionState.LinkIssued)
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        var session = await db.RecoverySessions.SingleOrDefaultAsync(
+            item => item.SessionId == sessionId,
+            cancellationToken);
+        if (session is null || session.State != SessionState.LinkIssued)
         {
-            return new ResetResult { Success = false, ErrorCode = "ERR_LINK_INVALID", ErrorDescription = "Token connection invalid or replayed." };
+            return false;
         }
 
-        // Programmatic syntax filter isolation logic
+        Escalate(session, "Reset link expired.");
+        session.Version++;
+        await ClearInboxDeliveryAsync(session.AccountId, cancellationToken);
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<ResetResult> ExecuteAuthoritativeResetAsync(
+        string token,
+        string rawPassword,
+        CancellationToken cancellationToken = default)
+    {
         if (rawPassword.Length < 8)
         {
-            return new ResetResult { Success = false, ErrorCode = "ERR_PASSWORD_WEAK", ErrorDescription = "Complexity policy constraint unmatched." };
+            return new ResetResult
+            {
+                Success = false,
+                ErrorCode = "ERR_PASSWORD_POLICY",
+                ErrorDescription = "The new password does not meet the minimum length requirement."
+            };
         }
 
-        var receipt = $"REC-TKT-{RandomNumberGenerator.GetInt32(100000, 999999)}";
+        var tokenHash = Hash(token);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        var session = await db.RecoverySessions.SingleOrDefaultAsync(
+            item => item.ResetTokenHash == tokenHash,
+            cancellationToken);
+
+        if (session is null)
+        {
+            return InvalidLink();
+        }
+
+        if (session.State == SessionState.Completed && session.ResolutionReceipt is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return new ResetResult { Success = true, ReceiptId = session.ResolutionReceipt };
+        }
+
+        if (session.State != SessionState.LinkIssued || session.LinkExpiry <= DateTime.UtcNow ||
+            session.AccountId is null)
+        {
+            return InvalidLink();
+        }
+
+        var account = await db.SyntheticAccounts.SingleOrDefaultAsync(
+            item => item.AccountId == session.AccountId,
+            cancellationToken);
+        if (account is null)
+        {
+            return InvalidLink();
+        }
+
+        var receipt = $"REC-{Guid.NewGuid():N}"[..16].ToUpperInvariant();
+        account.PasswordHash = passwordHasher.HashPassword(
+            new IdentityUser { Id = account.AccountId },
+            rawPassword);
         session.ResolutionReceipt = receipt;
         session.State = SessionState.Completed;
-        
-        _cache.Set($"{SessionPrefix}{session.SessionId}", session);
+        session.Version++;
+
+        var inbox = await db.MockInboxes.FindAsync([account.AccountId], cancellationToken);
+        if (inbox is not null)
+        {
+            inbox.LastSentCode = null;
+            inbox.SecureResetLink = null;
+            inbox.CodeExpiresAt = null;
+            inbox.LinkExpiresAt = null;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return new ResetResult { Success = true, ReceiptId = receipt };
     }
 
-private async Task HandleEscalationAsync(CallConnection connection, RecoverySession session, string message)
-{
-    session.State = SessionState.Escalated;
-    session.ResolutionReceipt = $"ESC-{Guid.NewGuid().ToString()[..8].ToUpperInvariant()}";
-    _cache.Set($"{SessionPrefix}{session.SessionId}", session,TimeSpan.FromMinutes(15));
-    
-    _cache.Remove($"{CallPrefix}{session.CallConnectionId}");
-    if (!string.IsNullOrEmpty(session.ResetToken))
+    private async Task ClearInboxDeliveryAsync(
+        string? accountId,
+        CancellationToken cancellationToken)
     {
-        _cache.Remove($"{TokenPrefix}{session.ResetToken}");
-    }
-    
-    
-    Console.WriteLine($"[MOCK IT TICKET LOG] System Escalation Triggered for Account {session.AccountId ?? "UNKNOWN"}. Reason: {message}");
-    
-    if (connection != null)
-    {
-        var media = connection.GetCallMedia();
-        await media.PlayToAllAsync(new TextSource("Verification protocols exhausted. Transferring your active session footprint tracking parameters over to operational service desk agents."));
-    }
-}
+        if (accountId is null)
+        {
+            return;
+        }
 
+        var inbox = await db.MockInboxes.FindAsync([accountId], cancellationToken);
+        if (inbox is null)
+        {
+            return;
+        }
+
+        inbox.LastSentCode = null;
+        inbox.SecureResetLink = null;
+        inbox.CodeExpiresAt = null;
+        inbox.LinkExpiresAt = null;
+    }
+
+    private static string NormalizeDigits(string input)
+    {
+        var normalized = new StringBuilder(input.Length);
+        foreach (Match match in Regex.Matches(input.ToLowerInvariant(), @"\d+|[a-z]+"))
+        {
+            if (match.Value.All(char.IsDigit))
+            {
+                normalized.Append(match.Value);
+                continue;
+            }
+
+            var digit = match.Value switch
+            {
+                "zero" or "oh" => '0',
+                "one" => '1',
+                "two" => '2',
+                "three" => '3',
+                "four" => '4',
+                "five" => '5',
+                "six" => '6',
+                "seven" => '7',
+                "eight" => '8',
+                "nine" => '9',
+                _ => '\0'
+            };
+            if (digit == '\0')
+            {
+                return string.Empty;
+            }
+            normalized.Append(digit);
+        }
+
+        return normalized.ToString();
+    }
+
+    private static string? NormalizeCode(string input) =>
+        NormalizeDigits(input) is { Length: 6 } normalized ? normalized : null;
+
+    private static string Hash(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+
+    private static bool IsHumanRequest(string input) =>
+        Regex.IsMatch(input, @"\b(human|agent|representative|operator)\b", RegexOptions.IgnoreCase);
+
+    private static void Escalate(RecoverySession session, string reason)
+    {
+        session.State = SessionState.Escalated;
+        session.VerificationCodeHash = null;
+        session.ResetTokenHash = null;
+        session.ResolutionReceipt = $"ESC-{Guid.NewGuid():N}"[..12].ToUpperInvariant();
+        session.EscalationReason = reason;
+    }
+
+    private static ResetResult InvalidLink() =>
+        new()
+        {
+            Success = false,
+            ErrorCode = "ERR_LINK_INVALID",
+            ErrorDescription = "The reset link is invalid, expired, or has already been used."
+        };
 }

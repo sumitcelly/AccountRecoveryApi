@@ -3,6 +3,9 @@ bin/
 obj/
 publish/
 TestResults/
+*.db
+*.db-shm
+*.db-wal
 
 # Visual Studio and IDE files
 .vs/

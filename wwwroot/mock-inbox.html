@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synthetic Recovery Inbox</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 34rem; padding: 0 1rem; }
+        label, input, button { display: block; margin: 0.6rem 0; }
+        input { box-sizing: border-box; padding: 0.6rem; width: 100%; }
+        button { cursor: pointer; padding: 0.6rem 1rem; }
+        #message { color: #a21caf; }
+        #deliveries { overflow-wrap: anywhere; }
+    </style>
+</head>
+<body>
+    <h1>Synthetic Recovery Inbox</h1>
+    <p>This exercise inbox is separate from the caller's voice session.</p>
+    <form id="login-form">
+        <label for="username">Inbox username</label>
+        <input id="username" name="username" autocomplete="username" required>
+        <label for="password">Inbox password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+    </form>
+    <section id="inbox" hidden>
+        <button id="refresh" type="button">Refresh inbox</button>
+        <button id="logout" type="button">Sign out</button>
+        <div id="deliveries"></div>
+    </section>
+    <p id="message" role="status" aria-live="polite"></p>
+
+    <script>
+        const form = document.getElementById("login-form");
+        const inboxSection = document.getElementById("inbox");
+        const deliveries = document.getElementById("deliveries");
+        const message = document.getElementById("message");
+
+        async function loadInbox() {
+            const response = await fetch("/api/mock/inbox", { credentials: "same-origin" });
+            if (response.status === 401) {
+                form.hidden = false;
+                inboxSection.hidden = true;
+                return;
+            }
+            if (!response.ok) {
+                throw new Error("Unable to load the inbox.");
+            }
+
+            const data = await response.json();
+            deliveries.replaceChildren();
+            if (data.verificationCode) {
+                const code = document.createElement("p");
+                code.textContent = `Verification code: ${data.verificationCode}`;
+                deliveries.append(code);
+            }
+            if (data.resetLink) {
+                const paragraph = document.createElement("p");
+                paragraph.append("Reset link: ");
+                const link = document.createElement("a");
+                link.href = data.resetLink;
+                link.textContent = "Open password reset form";
+                paragraph.append(link);
+                deliveries.append(paragraph);
+            }
+            if (!data.verificationCode && !data.resetLink) {
+                deliveries.textContent = "No active recovery messages.";
+            }
+            form.hidden = true;
+            inboxSection.hidden = false;
+            message.textContent = "";
+        }
+
+        form.addEventListener("submit", async event => {
+            event.preventDefault();
+            message.textContent = "";
+            try {
+                const response = await fetch("/api/mock/login", {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        username: document.getElementById("username").value,
+                        password: document.getElementById("password").value
+                    })
+                });
+                document.getElementById("password").value = "";
+                if (!response.ok) {
+                    message.textContent = "Sign-in failed. Check the inbox credentials or wait for the lockout to expire.";
+                    return;
+                }
+                await loadInbox();
+            } catch {
+                message.textContent = "Unable to contact the recovery service.";
+            }
+        });
+
+        document.getElementById("refresh").addEventListener("click", async () => {
+            try {
+                await loadInbox();
+            } catch {
+                message.textContent = "Unable to refresh the inbox.";
+            }
+        });
+
+        document.getElementById("logout").addEventListener("click", async () => {
+            await fetch("/api/mock/logout", { method: "POST", credentials: "same-origin" });
+            deliveries.replaceChildren();
+            form.hidden = false;
+            inboxSection.hidden = true;
+        });
+
+        loadInbox().catch(() => {
+            message.textContent = "Unable to contact the recovery service.";
+        });
+    </script>
+</body>
+</html>

@@ -1,196 +1,175 @@
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Caching.Memory;
-using Azure.Communication.CallAutomation;
 using AccountRecoveryApi.Domain;
+using Azure.Communication.CallAutomation;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace AccountRecoveryApi.Infrastructure;
 
-public class AccountRecoveryMonitorService : BackgroundService
+public sealed class AccountRecoveryMonitorService(
+    IServiceScopeFactory scopeFactory,
+    IServiceProvider services,
+    ILogger<AccountRecoveryMonitorService> logger) : BackgroundService
 {
-    private readonly IRecoveryMonitorQueue _monitorQueue;
-    private readonly IMemoryCache _cache;
-    private readonly IServiceProvider _services;
-    private readonly ILogger<AccountRecoveryMonitorService> _logger;
+    private readonly Dictionary<string, DateTime> _activeSessions = new();
     private bool _missingCallClientLogged;
-    
-    // In-memory active tracking register managed by the single thread loop
-    private readonly Dictionary<string, (DateTime Expiry, int PollCount)> _activeTrackers = new();
-    private const string SessionPrefix = "rec_sess_";
-    private const string CallPrefix = "call_idx_";
-    private const string TokenPrefix = "tok_idx_";
-
-    public AccountRecoveryMonitorService(
-        IRecoveryMonitorQueue monitorQueue, 
-        IMemoryCache cache,
-        IServiceProvider services,
-        ILogger<AccountRecoveryMonitorService> logger)
-    {
-        _monitorQueue = monitorQueue;
-        _cache = cache;
-        _services = services;
-        _logger = logger;
-    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        Console.WriteLine("[BACKGROUND WORKER] Authoritative Web Resolution Engine initialized.");
+        logger.LogInformation("Persistent recovery-session monitor started.");
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(3));
 
-        // Periodic ticker waking up every 3 seconds to process active monitoring steps
-        using var periodicTimer = new PeriodicTimer(TimeSpan.FromSeconds(3));
-
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            // 1. Drain any new sessions added to the tracking queue without blocking
-            while (_monitorQueue.TryDequeue(out var newSessionId))
+            do
             {
-                if (newSessionId != null)
+                await LoadPendingSessionsAsync(stoppingToken);
+                foreach (var (sessionId, expiry) in _activeSessions.ToArray())
                 {
-                    _activeTrackers[newSessionId] = (DateTime.UtcNow.AddMinutes(10), 0);
+                    await ProcessSessionAsync(sessionId, expiry, stoppingToken);
                 }
             }
-
-            // 2. Perform a single batch pass over all active calls
-            foreach (var (sessionId, (expiry, pollCount)) in _activeTrackers.ToList())
-            {
-                if (DateTime.UtcNow > expiry || pollCount >= 200)
-                {
-                    await ProcessTimeoutAsync(sessionId);
-                    _activeTrackers.Remove(sessionId);
-                    continue;
-                }
-
-                bool shouldKeepTracking = await EvaluateSessionStateAsync(sessionId);
-                if (!shouldKeepTracking)
-                {
-                    _activeTrackers.Remove(sessionId);
-                }
-                else
-                {
-                    // Increment the tick iteration count
-                    _activeTrackers[sessionId] = (expiry, pollCount + 1);
-                }
-            }
-
-            // 3. Sleep efficiently until the next iteration tick
-            await periodicTimer.WaitForNextTickAsync(stoppingToken);
+            while (await timer.WaitForNextTickAsync(stoppingToken));
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
         }
     }
 
-    private async Task<bool> EvaluateSessionStateAsync(string sessionId)
+    private async Task LoadPendingSessionsAsync(CancellationToken cancellationToken)
     {
-        if (!_cache.TryGetValue($"{SessionPrefix}{sessionId}", out RecoverySession? session) || session == null)
-            return false; // Evicted out-of-band, terminate tracking loop
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var engine = scope.ServiceProvider.GetRequiredService<IRecoverySessionEngine>();
+        var sessions = await engine.GetPendingMonitoringSessionsAsync(cancellationToken);
+        foreach (var session in sessions)
+        {
+            _activeSessions.TryAdd(session.SessionId, session.LinkExpiry);
+        }
+    }
 
-        if (session.State == SessionState.Escalated) 
-            return false;
+    private async Task ProcessSessionAsync(
+        string sessionId,
+        DateTime expiry,
+        CancellationToken cancellationToken)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var engine = scope.ServiceProvider.GetRequiredService<IRecoverySessionEngine>();
+        var session = await engine.GetSessionAsync(sessionId, cancellationToken);
+        if (session is null || session.State is SessionState.Escalated or SessionState.AwaitingId or SessionState.AwaitingCode)
+        {
+            _activeSessions.Remove(sessionId);
+            return;
+        }
 
         if (session.State == SessionState.Completed && !string.IsNullOrEmpty(session.ResolutionReceipt))
         {
-            await ExecuteSuccessPlaybackAsync(session);
-            return false; // Resolved successfully, stop tracking
+            await PlayMessageAndHangUpAsync(
+                session,
+                $"Your synthetic account reset is complete. Receipt: {session.ResolutionReceipt}.",
+                cancellationToken);
+            _activeSessions.Remove(sessionId);
+            return;
         }
 
-        // Handle Call Disconnection Check natively to prevent Ghost tasks
-        return await CheckCallSignalingActiveAsync(session.CallConnectionId);
+        if (session.State != SessionState.LinkIssued)
+        {
+            _activeSessions.Remove(sessionId);
+            return;
+        }
+
+        if (expiry <= DateTime.UtcNow)
+        {
+            if (await engine.ExpireSessionAsync(sessionId, cancellationToken))
+            {
+                logger.LogInformation("Recovery session {SessionId} expired and was escalated.", sessionId);
+                await PlayMessageAndHangUpAsync(
+                    session,
+                    "Your recovery session has expired. For your security, this call will now end. Please start again or contact support.",
+                    cancellationToken);
+            }
+            _activeSessions.Remove(sessionId);
+            return;
+        }
+
+        if (session.CallConnectionId is not null &&
+            !await IsCallConnectedAsync(session.CallConnectionId))
+        {
+            await engine.MarkCallDisconnectedAsync(sessionId, cancellationToken);
+        }
     }
 
-    private async Task<bool> CheckCallSignalingActiveAsync(string callConnectionId)
+    private async Task<bool> IsCallConnectedAsync(string callConnectionId)
     {
         var callClient = GetCallAutomationClient();
-        if (callClient == null)
+        if (callClient is null)
         {
             return true;
         }
 
         try
         {
-            var connection = callClient.GetCallConnection(callConnectionId);
-            var properties = await connection.GetCallConnectionPropertiesAsync();
+            var properties = await callClient
+                .GetCallConnection(callConnectionId)
+                .GetCallConnectionPropertiesAsync();
             return properties?.Value?.CallConnectionState == CallConnectionState.Connected;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unable to check call state for connection {CallConnectionId}; monitoring will retry.", callConnectionId);
+            logger.LogWarning(ex, "Unable to check call {CallConnectionId}; the monitor will retry.", callConnectionId);
             return true;
         }
     }
 
-    private async Task ExecuteSuccessPlaybackAsync(RecoverySession session)
+    private async Task PlayMessageAndHangUpAsync(
+        RecoverySession session,
+        string message,
+        CancellationToken cancellationToken)
     {
         var callClient = GetCallAutomationClient();
-        if (callClient == null)
+        if (callClient is null || session.CallConnectionId is null)
+        {
+            return;
+        }
+
+        CallConnection? connection = null;
+        try
+        {
+            connection = callClient.GetCallConnection(session.CallConnectionId);
+            await connection.GetCallMedia().PlayToAllAsync(new TextSource(message), cancellationToken);
+            await Task.Delay(TimeSpan.FromSeconds(8), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Unable to play call message for recovery session {SessionId}.", session.SessionId);
+        }
+
+        if (connection is null)
         {
             return;
         }
 
         try
         {
-            var connection = callClient.GetCallConnection(session.CallConnectionId);
-            var media = connection.GetCallMedia();
-            await media.PlayToAllAsync(new TextSource($"Transaction completed. Ticket reference: {session.ResolutionReceipt}."));
-            await Task.Delay(TimeSpan.FromSeconds(5)); // Brief delivery window
-            await connection.HangUpAsync(true);
+            await connection.HangUpAsync(true, cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unable to play recovery completion message for session {SessionId}.", session.SessionId);
+            logger.LogWarning(ex, "Unable to hang up call for recovery session {SessionId}.", session.SessionId);
         }
     }
 
     private CallAutomationClient? GetCallAutomationClient()
     {
-        var callClient = _services.GetService<CallAutomationClient>();
-        if (callClient == null && !_missingCallClientLogged)
+        var client = services.GetService<CallAutomationClient>();
+        if (client is null && !_missingCallClientLogged)
         {
-            _logger.LogError("CallAutomationClient is unavailable; call monitoring actions cannot be performed.");
+            logger.LogError("CallAutomationClient is unavailable; call monitoring actions cannot be performed.");
             _missingCallClientLogged = true;
         }
 
-        return callClient;
-    }
-
-    private async Task ProcessTimeoutAsync(string sessionId)
-    {
-        if (_cache.TryGetValue($"{SessionPrefix}{sessionId}", out RecoverySession? session) && session != null)
-        {
-            session.State = SessionState.Escalated;
-            _cache.Set($"{SessionPrefix}{sessionId}", session, TimeSpan.FromMinutes(15));
-            _cache.Remove($"{CallPrefix}{session.CallConnectionId}");
-            if (!string.IsNullOrEmpty(session.ResetToken))
-            {
-                _cache.Remove($"{TokenPrefix}{session.ResetToken}");
-            }
-
-            _logger.LogInformation("Recovery session {SessionId} expired and was escalated.", sessionId);
-
-            var callClient = GetCallAutomationClient();
-            if (callClient != null)
-            {
-                CallConnection? connection = null;
-                try
-                {
-                    connection = callClient.GetCallConnection(session.CallConnectionId);
-                    await connection.GetCallMedia().PlayToAllAsync(new TextSource(
-                        "Your recovery session has expired. For your security, this call will now end. Please start again or contact support."));
-                    await Task.Delay(TimeSpan.FromSeconds(8));
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Unable to play timeout message for session {SessionId}. The call will still be ended.", sessionId);
-                }
-
-                if (connection != null)
-                {
-                    try
-                    {
-                        await connection.HangUpAsync(true);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Unable to hang up timed-out recovery call for session {SessionId}.", sessionId);
-                    }
-                }
-            }
-        }
+        return client;
     }
 }
