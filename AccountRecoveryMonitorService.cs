@@ -161,20 +161,34 @@ public class AccountRecoveryMonitorService : BackgroundService
                 _cache.Remove($"{TokenPrefix}{session.ResetToken}");
             }
 
-            Console.WriteLine($"[MONITOR TIMEOUT] Session {sessionId} escalated due to web synchronization timeout.");
+            _logger.LogInformation("Recovery session {SessionId} expired and was escalated.", sessionId);
 
             var callClient = GetCallAutomationClient();
             if (callClient != null)
             {
+                CallConnection? connection = null;
                 try
                 {
-                    var connection = callClient.GetCallConnection(session.CallConnectionId);
+                    connection = callClient.GetCallConnection(session.CallConnectionId);
                     await connection.GetCallMedia().PlayToAllAsync(new TextSource(
-                        "Verification protocols exhausted. Transferring your active session to the operational service desk."));
+                        "Your recovery session has expired. For your security, this call will now end. Please start again or contact support."));
+                    await Task.Delay(TimeSpan.FromSeconds(8));
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Unable to play escalation message for session {SessionId}.", sessionId);
+                    _logger.LogWarning(ex, "Unable to play timeout message for session {SessionId}. The call will still be ended.", sessionId);
+                }
+
+                if (connection != null)
+                {
+                    try
+                    {
+                        await connection.HangUpAsync(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Unable to hang up timed-out recovery call for session {SessionId}.", sessionId);
+                    }
                 }
             }
         }
