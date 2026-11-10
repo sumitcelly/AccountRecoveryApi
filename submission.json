@@ -5,7 +5,7 @@
   "phone_e164": "REPLACE_WITH_ASSIGNED_US_TOLL_FREE_E164",
   "reset_base_url": "https://reset.example.invalid",
   "repository_url": "https://github.com/sumitcelly/AccountRecoveryApi",
-  "commit_sha": "REPLACE_WITH_40_HEX_COMMIT_SHA",
+  "commit_sha": "224f090a5cf93369ab4881c6f40c142f06bb90d3",
   "azure_architecture": "ASP.NET Core .NET 8 API; Azure Communication Services Call Automation for voice; Azure Event Grid for call events; EF Core/SQLite for recovery state; ASP.NET Core Identity for mock inbox authentication. No LLM integration. ACS is not configured; telephony is untested and webhook verification is not implemented.",
   "setup_document": "README.md",
   "video_url": null,
